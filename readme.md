@@ -1,6 +1,6 @@
 # Static FFmpeg builds
 
-Build musl-linked `ffmpeg` and `ffprobe` binaries for Linux in Docker. The Dockerfile compiles FFmpeg and several codec libraries from source and links them with static libraries from Alpine packages.
+Build musl-linked `ffmpeg` and `ffprobe` binaries for Linux in Docker. The Dockerfile compiles FFmpeg and several codec libraries from source and links them with static libraries from Alpine packages. Can be copied anywhere to work.
 
 ## Prerequisites
 
