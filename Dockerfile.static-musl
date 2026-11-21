@@ -1,0 +1,219 @@
+# Fully static, musl-linked FFmpeg and ffprobe. Run build-static-ffmpeg.sh
+# to select sources and export the binaries to the host.
+
+ARG ALPINE_VERSION
+FROM alpine:${ALPINE_VERSION} AS builder
+
+# Toolchain + every codec/support library that Alpine provides as a static
+# archive. `<lib>-static` subpackages carry the .a; a few (.a in the -dev
+# package) only need the -dev. libz/bz2/xz/expat/etc. are transitive deps
+# of the above and must be static too so the final link is self-contained.
+RUN apk add --no-cache \
+        build-base cmake meson ninja nasm yasm pkgconf coreutils \
+        autoconf automake libtool git wget diffutils perl file python3 \
+        zlib-dev zlib-static \
+        bzip2-dev bzip2-static \
+        xz-dev xz-static \
+        expat-dev expat-static \
+        brotli-dev brotli-static \
+        openssl-dev openssl-libs-static \
+        x264-dev \
+        aom-dev aom-static \
+        lame-dev \
+        openjpeg-dev \
+        libbs2b-dev \
+        flite-dev flite-static \
+        rav1e-dev rav1e-static \
+        libvorbis-dev libvorbis-static \
+        libogg-dev libogg-static \
+        libtheora-dev libtheora-static \
+        libwebp-dev libwebp-static \
+        soxr-dev soxr-static \
+        rubberband-dev rubberband-static fftw-static \
+        vo-amrwbenc-dev vo-amrwbenc-static \
+        xvidcore-dev xvidcore-static \
+        libmodplug-dev libmodplug-static \
+        snappy-dev snappy-static \
+        lcms2-dev lcms2-static \
+        libxml2-dev libxml2-static \
+        libsamplerate-dev libsamplerate-static \
+        giflib-dev giflib-static \
+        freetype-dev freetype-static \
+        fontconfig-dev fontconfig-static \
+        fribidi-dev fribidi-static \
+        harfbuzz-dev harfbuzz-static \
+        graphite2-dev graphite2-static \
+        glib-static gettext-static \
+        libpng-dev libpng-static \
+        libjpeg-turbo-dev libjpeg-turbo-static
+
+# Everything we build from source installs here; searched first by pkg-config.
+ENV PREFIX=/usr/local
+ENV PKG_CONFIG_PATH=/usr/local/lib/pkgconfig:/usr/local/lib64/pkgconfig:/usr/lib/pkgconfig
+ENV CFLAGS="-O2 -fPIC" CXXFLAGS="-O2 -fPIC"
+WORKDIR /build
+
+# Fetch a release tarball or clone the explicit tag or branch in a Git URL.
+RUN <<'EOF'
+set -eu
+cat > /usr/local/bin/fetch-source <<'SCRIPT'
+#!/bin/sh
+set -eu
+
+source=${1:?source URL required}
+directory=${2:?destination required}
+case "$source" in
+    *.git#*)
+        git clone --recurse-submodules "${3:---depth=1}" \
+            --branch "${source##*#}" "${source%#*}" "$directory"
+        git -C "$directory" rev-parse HEAD
+        ;;
+    *)
+        archive=$(mktemp)
+        trap 'rm -f "$archive"' EXIT
+        wget -O "$archive" "$source"
+        mkdir -p "$directory"
+        tar -xf "$archive" --strip-components=1 -C "$directory"
+        ;;
+esac
+SCRIPT
+chmod +x /usr/local/bin/fetch-source
+EOF
+
+# ---- pcre2 (static) ------------------------------------------------------
+# Alpine has no static pcre2, but glib (pulled in by harfbuzz) needs it to
+# complete the fully-static libass/harfbuzz text-shaping link chain.
+ARG PCRE2_SOURCE
+RUN fetch-source "$PCRE2_SOURCE" pcre2 && \
+    cd pcre2 && \
+    { [ -x ./configure ] || ./autogen.sh; } && \
+    ./configure --prefix=$PREFIX --disable-shared --enable-static && \
+    make -j"$(nproc)" && make install
+
+# ---- Opus (audio) --------------------------------------------------------
+ARG OPUS_SOURCE
+RUN fetch-source "$OPUS_SOURCE" opus && \
+    cd opus && \
+    { [ -x ./configure ] || ./autogen.sh; } && \
+    ./configure --prefix=$PREFIX --disable-shared --enable-static \
+        --disable-doc --disable-extra-programs && \
+    make -j"$(nproc)" && make install
+
+# ---- libvpx (VP8/VP9) ----------------------------------------------------
+ARG VPX_SOURCE
+RUN fetch-source "$VPX_SOURCE" libvpx && \
+    cd libvpx && \
+    ./configure --prefix=$PREFIX --disable-shared --enable-static --enable-pic \
+        --enable-vp8 --enable-vp9 --enable-vp9-highbitdepth \
+        --disable-examples --disable-tools --disable-docs --disable-unit-tests && \
+    make -j"$(nproc)" && make install
+
+# ---- x265 (HEVC) ---------------------------------------------------------
+# x265 uses reachable release tags to compute its version, so keep history.
+ARG X265_SOURCE
+RUN fetch-source "$X265_SOURCE" x265 --single-branch && \
+    cd x265 && \
+    sed -i \
+        -e 's/cmake_policy(SET CMP0025 OLD)/cmake_policy(SET CMP0025 NEW)/' \
+        -e 's/cmake_policy(SET CMP0054 OLD)/cmake_policy(SET CMP0054 NEW)/' \
+        -e 's/cmake_minimum_required (VERSION 2.8.8)/cmake_minimum_required (VERSION 3.5)/' \
+        source/CMakeLists.txt && \
+    cd build/linux && \
+    cmake -G "Unix Makefiles" ../../source \
+        -DCMAKE_INSTALL_PREFIX=$PREFIX -DENABLE_SHARED=OFF -DENABLE_CLI=OFF && \
+    make -j"$(nproc)" && make install
+
+# ---- dav1d (AV1 decode) --------------------------------------------------
+ARG DAV1D_SOURCE
+RUN fetch-source "$DAV1D_SOURCE" dav1d && \
+    cd dav1d && \
+    meson setup build --prefix=$PREFIX --libdir=lib --default-library=static \
+        --buildtype=release -Denable_tools=false -Denable_tests=false && \
+    ninja -C build && ninja -C build install
+
+# ---- SVT-AV1 (AV1 encode) ------------------------------------------------
+ARG SVTAV1_SOURCE
+RUN fetch-source "$SVTAV1_SOURCE" svt-av1 && \
+    cd svt-av1 && \
+    cmake -S . -B build -G "Unix Makefiles" \
+        -DCMAKE_INSTALL_PREFIX=$PREFIX -DCMAKE_BUILD_TYPE=Release \
+        -DBUILD_SHARED_LIBS=OFF -DBUILD_APPS=OFF \
+        -DCMAKE_POLICY_VERSION_MINIMUM=3.5 && \
+    make -j"$(nproc)" -C build && make -C build install
+
+# ---- zimg (scaling) ------------------------------------------------------
+ARG ZIMG_SOURCE
+RUN fetch-source "$ZIMG_SOURCE" zimg && \
+    cd zimg && ./autogen.sh && \
+    ./configure --prefix=$PREFIX --disable-shared --enable-static && \
+    make -j"$(nproc)" && make install
+
+# ---- fdk-aac (AAC enc/dec) — no Alpine static archive, build from source --
+# NOTE: fdk-aac is not GPL-compatible; it forces FFmpeg's --enable-nonfree,
+# making the resulting binary non-redistributable (personal use only).
+ARG FDKAAC_SOURCE
+RUN fetch-source "$FDKAAC_SOURCE" fdk-aac && \
+    cd fdk-aac && ./autogen.sh && \
+    ./configure --prefix=$PREFIX --disable-shared --enable-static && \
+    make -j"$(nproc)" && make install
+
+# ---- libass (subtitles) — needs freetype/fribidi/fontconfig/harfbuzz -----
+ARG LIBASS_SOURCE
+RUN fetch-source "$LIBASS_SOURCE" libass && \
+    cd libass && \
+    { [ -x ./configure ] || ./autogen.sh; } && \
+    ./configure --prefix=$PREFIX --disable-shared --enable-static && \
+    make -j"$(nproc)" && make install
+
+# ---- sanitize pkg-config files for static linking ------------------------
+# Several C++ libs (e.g. x265) list -lgcc_s in Libs.private. libgcc_s is a
+# shared-only GCC support lib with no static archive, so `gcc -static` fails
+# to find it and FFmpeg's pkg-config link checks fail. Static libgcc/libgcc_eh
+# (auto-linked by gcc -static) already provide the same functionality, so
+# strip -lgcc_s from every .pc file.
+RUN sed -i 's/-lgcc_s//g' /usr/local/lib/pkgconfig/*.pc /usr/lib/pkgconfig/*.pc
+
+# ===========================================================================
+# FFmpeg itself
+# ===========================================================================
+WORKDIR /src
+ARG FFMPEG_SOURCE
+RUN fetch-source "$FFMPEG_SOURCE" .
+
+RUN ./configure \
+        --pkg-config-flags="--static" \
+        --extra-cflags="-static -I$PREFIX/include" \
+        --extra-ldflags="-static -no-pie -L$PREFIX/lib" \
+        --extra-libs="-lpthread -lm -lgomp" \
+        --enable-static --disable-shared \
+        --disable-debug --disable-doc \
+        --enable-gpl --enable-version3 --enable-nonfree \
+        --enable-openssl \
+        --enable-libfdk-aac \
+        --enable-libx264 --enable-libx265 --enable-libvpx \
+        --enable-libaom --enable-libsvtav1 --enable-libdav1d --enable-librav1e \
+        --enable-libxvid --enable-libopenjpeg \
+        --enable-libmp3lame --enable-libopus --enable-libvorbis \
+        --enable-libtheora --enable-libvo-amrwbenc \
+        --enable-libwebp --enable-libsnappy \
+        --enable-libass --enable-libfreetype --enable-libfontconfig \
+        --enable-libfribidi --enable-libharfbuzz \
+        --enable-libsoxr --enable-librubberband --enable-libmodplug \
+        --enable-libbs2b --enable-libzimg --enable-libxml2 \
+    && make -j"$(nproc)" \
+    && strip ffmpeg ffprobe
+
+# Fail the build unless the binary is genuinely static (no dynamic deps and
+# not a PIE that needs the musl loader). `ldd` phrasing differs between libcs,
+# so check the ELF directly: a self-contained static executable has no NEEDED
+# entries and `file` reports "statically linked".
+RUN if readelf -d ffmpeg 2>/dev/null | grep -q NEEDED; then \
+        echo "ERROR: ffmpeg has dynamic dependencies"; readelf -d ffmpeg; exit 1; \
+    fi; \
+    file ffmpeg | grep -q "statically linked" || \
+    { echo "ERROR: ffmpeg is not statically linked"; file ffmpeg; exit 1; }
+
+# ===========================================================================
+FROM scratch AS export
+COPY --from=builder /src/ffmpeg /ffmpeg
+COPY --from=builder /src/ffprobe /ffprobe
